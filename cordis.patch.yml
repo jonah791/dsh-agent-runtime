@@ -1,0 +1,4 @@
+- insert:
+    - id: agent-agent-runtime
+      name: dsh-agent-runtime
+      config: {}

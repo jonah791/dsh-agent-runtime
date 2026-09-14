@@ -17,9 +17,23 @@
 import type { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { spawn, execFile, type ChildProcess } from 'node:child_process'
-import { existsSync, writeFileSync, mkdirSync } from 'node:fs'
+import { existsSync, writeFileSync, mkdirSync, appendFileSync, statSync, truncateSync } from 'node:fs'
 import { join } from 'node:path'
 import net from 'node:net'
+import { buildLaunchCmd, discoverBin, isDshWebCommandLine, parsePortOwner } from './pure.ts'
+
+const WEB_LOG_MAX_BYTES = 2 * 1024 * 1024
+
+/** web 进程 stdout/stderr 落盘（`$DSH_HOME/.watch-web.log`）——崩溃栈可离线取证。
+ * 超过 2MB 截半防无限增长；转存失败绝不影响主流程。
+ * **导出仅供单测**（observability.test.mjs 用坏路径断言「不抛」）：观测绝不反噬主流程（§5.22 C4）。 */
+export function writeWebLog(dshHome: string, stream: 'out' | 'err', chunk: Buffer): void {
+  try {
+    const file = join(dshHome || process.cwd(), '.watch-web.log')
+    if (existsSync(file) && statSync(file).size > WEB_LOG_MAX_BYTES) truncateSync(file, Math.floor(WEB_LOG_MAX_BYTES / 2))
+    appendFileSync(file, '[' + new Date().toISOString() + ' ' + stream + '] ' + chunk.toString('utf8'))
+  } catch { /* 转存失败不影响主流程 */ }
+}
 
 export const name = 'agent-runtime'
 export const inject = [] as const
@@ -97,29 +111,19 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- bin 发现（源码安装：跟随当前进程的 bin.js） ----------
   // 源码安装特点：dsh 从 checkout 的 apps/cli/lib/bin.js 运行。
   // 当前进程若是 dsh（watch/web），process.argv[1] 即 bin.js；否则从 env/常用路径兜底。
-  function discoverBin(): string {
-    if (config.bin) return config.bin
-    const argv1 = process.argv[1]
-    if (argv1 && /bin\.js$/.test(argv1) && existsSync(argv1)) return argv1
-    // 兜底：DSH_HOME 或已知源码位置
-    const candidates = [
-      join(dshHome, 'deepseek-harness', 'apps', 'cli', 'lib', 'bin.js'),
-      'E:/alice/deepseek-harness/apps/cli/lib/bin.js',
-    ]
-    for (const c of candidates) {
-      if (existsSync(c)) return c
-    }
-    return ''
+  // 决策在 src/pure.ts（可离线单测）；这里只提供 IO（existsSync）与进程环境。
+  function discover(): string {
+    return discoverBin(config.bin, { argv1: process.argv[1], dshHome, exists: existsSync })
   }
 
-  let bin = discoverBin()
+  let bin = discover()
   const profile = config.profile
   const port = config.port
   const baseUrl = config.baseUrl
   const workspace = config.defaultWorkspace || process.cwd()
-  const launchCmd = config.launchCmd.length > 0
-    ? config.launchCmd
-    : (bin ? [process.execPath, '--expose-internals', bin, '--profile', profile, '--no-open'] : [])
+  // 启动命令**按当前 bin 现算**（修前是一次性快照：resolve() 更新了 bin，
+  // 但 bin 从「未发现」变为「已发现」时 launchCmd 仍是空数组 → spawnWeb 报「启动命令为空」→ 保活失效）
+  const launchFor = (b: string): string[] => buildLaunchCmd(config.launchCmd, b, process.execPath, profile)
 
   const runtime: RuntimeService = {
     get bin() { return bin },
@@ -128,11 +132,11 @@ export function apply(ctx: Context, config: Config): void {
     get baseUrl() { return baseUrl },
     get dshHome() { return dshHome },
     get workspace() { return workspace },
-    get launchCmd() { return launchCmd },
+    get launchCmd() { return launchFor(bin) },
     resolve() {
-      const b = discoverBin()
+      const b = discover()
       if (b !== bin) {
-        logger.info('bin 路径更新: ' + bin + ' -> ' + b)
+        logger.info('bin 路径更新: ' + bin + ' -> ' + b + '（启动命令随之重算: ' + (launchFor(b).join(' ') || '仍为空') + '）')
         bin = b
       }
     },
@@ -155,10 +159,7 @@ export function apply(ctx: Context, config: Config): void {
           if (err) reject(err); else resolvePromise(stdout)
         })
       })
-      for (const line of out.split(/\r?\n/)) {
-        const m = line.trim().match(new RegExp('TCP\\s+127\\.0\\.0\\.1:' + port + '\\s+0\\.0\\.0\\.0:0\\s+LISTENING\\s+(\\d+)'))
-        if (m && m[1]) return Number(m[1])
-      }
+      return parsePortOwner(out, port)
     } catch { /* 忽略 */ }
     return null
   }
@@ -170,7 +171,7 @@ export function apply(ctx: Context, config: Config): void {
           if (err) reject(err); else resolvePromise(stdout)
         })
       })
-      return (/bin\.js/.test(out) && /\bweb\b/.test(out)) || /@deepseek-ai\/dsh/.test(out)
+      return isDshWebCommandLine(out)
     } catch { return false }
   }
 
@@ -224,8 +225,9 @@ export function apply(ctx: Context, config: Config): void {
             }
           } catch { /* 忽略 */ }
           try { process.stderr.write(d) } catch { /* 忽略 */ }
+          writeWebLog(dshHome, 'out', d)
         })
-        child.stderr?.on('data', (d: Buffer) => { try { process.stderr.write(d) } catch { /* 忽略 */ } })
+        child.stderr?.on('data', (d: Buffer) => { try { process.stderr.write(d) } catch { /* 忽略 */ }; writeWebLog(dshHome, 'err', d) })
         child.on('error', () => { /* 交给 exit */ })
         child.on('exit', (code, signal) => {
           if (onExit) onExit(code, signal)

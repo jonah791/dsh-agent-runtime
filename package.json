@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-runtime",
   "version": "0.1.0",
-  "description": "守护运行时服务：runtime 环境发现（bin/port/profile 单一来源）+ webman 进程管理（spawn/kill/portOwner），消除 sentinel/guardian 重复",
+  "description": "守护运行时服务：runtime 环境发现（bin/port/profile 单一来源）+ webman 进程管理（spawn/kill/portOwner），消除 sentinel/guardian 重复（只提供 service，不注册工具）",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
